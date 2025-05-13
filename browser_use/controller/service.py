@@ -3,6 +3,8 @@ import enum
 import json
 import logging
 import re
+import os
+import urllib.parse
 from typing import Generic, TypeVar, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -37,6 +39,20 @@ logger = logging.getLogger(__name__)
 
 Context = TypeVar('Context')
 
+SCRAPER_API_KEY = os.getenv('SCRAPER_API_KEY')
+
+def scraperapi_url(url: str, render: bool = False) -> str:
+	return f'https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}&url={url}{"&render=true" if render else ""}'
+
+def extract_orignial_url(scraperapi_url: str) -> str:
+	parsed_url = urllib.parse.urlparse(scraperapi_url)
+
+	query_params = urllib.parse.parse_qs(parsed_url.query)
+
+	if 'url' in query_params:
+		return query_params['url'][0]
+	else:
+		return None
 
 class Controller(Generic[Context]):
 	def __init__(
@@ -84,7 +100,9 @@ class Controller(Generic[Context]):
 		)
 		async def search_google(params: SearchGoogleAction, browser: BrowserContext):
 			page = await browser.get_current_page()
-			await page.goto(f'https://www.google.com/search?q={params.query}&udm=14')
+			google_url = scraperapi_url(f'https://www.google.com/search?q={params.query}&udm=14')
+			print(google_url)
+			await page.goto(google_url)
 			await page.wait_for_load_state()
 			msg = f'🔍  Searched for "{params.query}" in Google'
 			logger.info(msg)
@@ -93,7 +111,7 @@ class Controller(Generic[Context]):
 		@self.registry.action('Navigate to URL in the current tab', param_model=GoToUrlAction)
 		async def go_to_url(params: GoToUrlAction, browser: BrowserContext):
 			page = await browser.get_current_page()
-			await page.goto(params.url)
+			await page.goto(scraperapi_url(params.url))
 			await page.wait_for_load_state()
 			msg = f'🔗  Navigated to {params.url}'
 			logger.info(msg)
@@ -129,6 +147,51 @@ class Controller(Generic[Context]):
 			if await browser.is_file_uploader(element_node):
 				msg = f'Index {params.index} - has an element which opens file upload dialog. To upload files please use a specific function to upload files '
 				logger.info(msg)
+				return ActionResult(extracted_content=msg, include_in_memory=True)
+
+			# If a link, don't click it and page.goto the url
+			page = session.context.pages[-1]
+			if element_node.tag_name.lower() == 'a' and element_node.attributes.get('href'):
+				href = element_node.attributes.get('href')
+				# Handle relative URLs
+				if href.startswith('/'):
+					current_url = extract_orignial_url(page.url)
+					base_url = current_url.split('://', 1)[0] + '://' + current_url.split('://', 1)[1].split('/', 1)[0]
+					href = base_url + href
+				elif href.startswith('#'):
+					section_id = href.split('#', 1)[1]
+					logger.info(f'Found link with href to section: #{section_id}, scrolling instead of navigating')
+
+					try:
+						await page.evaluate(f"""() => {{
+					            const element = document.getElementById('{section_id}');
+					            if (element) {{
+					                element.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+					                return true;
+					            }}
+					            return false;
+					        }}""")
+						msg = f'📜 Scrolled to section with id #{section_id} at index {params.index}'
+						return ActionResult(extracted_content=msg, include_in_memory=True)
+					except Exception as e:
+						# Fall back
+						logger.warning(f'Failed to scroll to section #{section_id}: {str(e)}')
+
+
+				elif not href.startswith(('http://', 'https://')):
+					# Handle URLs without protocol or relative to current path
+					current_url = extract_orignial_url(page.url)
+					if current_url.endswith('/'):
+						href = current_url + href
+					else:
+						last_slash = current_url.rfind('/')
+						base_path = current_url[
+									:last_slash + 1] if last_slash > 8 else current_url + '/'  # 8 is roughly the length of http(s)://
+						href = base_path + href
+
+				logger.info(f'Found link with href: {href}, navigating instead of clicking')
+				await page.goto(scraperapi_url(href))
+				msg = f'🔗 Navigated to link at index {params.index}: {href}'
 				return ActionResult(extracted_content=msg, include_in_memory=True)
 
 			msg = None
@@ -199,7 +262,7 @@ class Controller(Generic[Context]):
 
 		@self.registry.action('Open url in new tab', param_model=OpenTabAction)
 		async def open_tab(params: OpenTabAction, browser: BrowserContext):
-			await browser.create_new_tab(params.url)
+			await browser.create_new_tab(scraperapi_url(params.url))
 			# Ensure tab references are properly synchronized
 			await browser.get_agent_current_page()  # this has side-effects (even though it looks like a getter)
 			msg = f'🔗  Opened new tab with {params.url}'
